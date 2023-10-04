@@ -2,17 +2,11 @@
 
 set -e
 # Root cb-multios directory
-DIR=${CGC_CB_DIR}
+DIR=$(dirname -- $(realpath -- ${BASH_SOURCE[0]}))
 TOOLS="$DIR/tools"
-SCRIPTDIR=$(dirname -- $(realpath -- ${BASH_SOURCE[0]}))
-for i in cb-replay.py cb-replay-pov.py challenge_runner.py common.py tester.py ansi_x931_aes128.py; do
-cp $SCRIPTDIR/$i $TOOLS/$i
-done
-for i in CMakeLists.txt build.sh cgc-cb.list cgc-c.list cgc-cpp.list cb_fixes.bash; do
-cp $SCRIPTDIR/$i $DIR/$i
-done
+
 NINJA_ENABLED=0
-$SCRIPTDIR/cb_fixes.bash
+$TOOLS/cb_fixes.bash
 
 # Install necessary python packages
 if ! /usr/bin/env python2 -c "import xlsxwriter; import Crypto" 2>/dev/null; then
@@ -75,7 +69,7 @@ if (( $ALL_CBS == 1 )); then
 cmake --build . $BUILD_FLAGS
 else
   echo "Compiling known good CGC Challenge Binaries"
-  for cb in $(cat ${SCRIPTDIR}/cgc-cb.list); do
+  for cb in $(cat ${TOOLS}/cgc-cb.list); do
      pushd $BUILDDIR/challenges/$cb ; make ; popd
   done
 fi
