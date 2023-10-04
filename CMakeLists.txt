@@ -1,12 +1,15 @@
 # Using this min version for now
 cmake_minimum_required(VERSION 3.1)
 
-project(challenge_sets C CXX)
+project(challenge_sets)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Needed for newer challenges
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 11)
+
+set(BUILD 32)
+#set(BUILD ${BUILD} CACHE INT "Build either 32 or 64 images.")
 
 if(WIN32)
     # Need to use MASM on windows
@@ -38,6 +41,7 @@ else(WIN32)
     # Generic ASM can be enabled on other OSs
     enable_language(ASM)
 
+	string(CONCAT BUILD_TYPE "-m" "${BUILD}")
     if(UNIX AND NOT APPLE)
         set(LINUX TRUE)
         add_definitions(-DLINUX)
@@ -55,11 +59,13 @@ else(WIN32)
     # Default flags for everything
     add_compile_options(
         -fno-builtin
-        -fcommon
         -w
         -g3
+		${BUILD_TYPE}
     )
-
+    # Link everything 32-bit (until we have a 64-bit option)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${BUILD_TYPE}") 
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${BUILD_TYPE} ") 
     # Linker options
     # Dynamic by default
     option(BUILD_SHARED_LIBS "" ON)
@@ -99,8 +105,8 @@ function(build path target)
     # Add patched defines
     target_compile_definitions(${target}_patched PUBLIC ${patch_defs})
 
-    target_link_libraries(${target} LINK_PUBLIC cgc)
-    target_link_libraries(${target}_patched LINK_PUBLIC cgc)
+    target_link_libraries(${target} LINK_PUBLIC -Wl,--start-group pov cgc tiny-AES128-C -Wl,--end-group)
+    target_link_libraries(${target}_patched LINK_PUBLIC -Wl,--start-group pov cgc tiny-AES128-C -Wl,--end-group)
 
     IF(WIN32)
         # Copy required DLLs post-build
@@ -231,14 +237,15 @@ file(GLOB challenge_binaries challenges/*)
 foreach(cb_path ${challenge_binaries})
     if(IS_DIRECTORY ${cb_path} AND EXISTS ${cb_path}/CMakeLists.txt)
         # Get filename
-        get_filename_component(cb_id ${cb_path} NAME)
-
-        # Skip the challenge if it's in the exclude list
-        list(FIND cb_exclude ${cb_id} idx)
-        if(${idx} EQUAL -1)
-            add_subdirectory(${cb_path})
-        else()
-            message(STATUS "EXCLUDE: ${cb_id}")
+            get_filename_component(cb_id ${cb_path} NAME)
+    
+            # Skip the challenge if it's in the exclude list
+            list(FIND cb_exclude ${cb_id} idx)
+            if(${idx} EQUAL -1)
+                add_subdirectory(${cb_path})
+            else()
+                message(STATUS "EXCLUDE: ${cb_id}")
+            endif()
         endif()
-    endif()
-endforeach()
+    endforeach()
+

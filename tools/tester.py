@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import argparse
 import glob
 import os
@@ -10,7 +10,7 @@ import xlsxwriter.utility as xlutil
 
 from common import debug, listdir
 
-TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROOT = os.path.dirname(TOOLS_DIR)
 CHAL_DIR = os.path.join(ROOT, 'challenges')
 POLL_DIR = os.path.join(ROOT, 'polls')
@@ -43,6 +43,8 @@ class Tester:
     # Both are enabled by default
     povs_enabled = True
     polls_enabled = True
+    genprog_enabled=False
+    gpbin=None
 
     def __init__(self, chal_name):
         self.name = chal_name
@@ -81,13 +83,14 @@ class Tester:
             (int, int): # of tests run, # of tests passed
         """
         # If the test failed to run, consider it failed
-        if 'TOTAL TESTS' not in output:
+        if b'TOTAL TESTS' not in output:
             debug('\nWARNING: there was an error running a test')
-            print output
+            print(output)
             return 0, 0
 
         if 'timed out' in output:
-            debug('\nWARNING: test(s) timed out')
+            debug('\nWARNING: '+str(output.count('timed out'))+' test(s) timed out')
+        #debug('\n============START OF OUTPUT===========\n'+output+'\n============  END OF OUTPUT===========\n')
 
         # Parse out results
         total = int(output.split('TOTAL TESTS: ')[1].split('\n')[0])
@@ -103,15 +106,21 @@ class Tester:
             score (Score): Object to store the results in
             should_core (bool): If the binary is expected to crash with these tests
         """
-        cb_cmd = [sys.executable, 'cb-test.py',
+        bin_path = os.path.dirname(os.path.realpath(__file__))
+        cb_test = os.path.join(bin_path, 'cb-test.py')
+
+        cb_cmd = [sys.executable, cb_test,
                   '--directory', self.bin_dir,
                   '--xml_dir', xml_dir,
                   '--concurrent', '4',
                   '--timeout', '5',
-                  '--negotiate_seed', '--cb'] + map(add_ext, bin_names)
+                  '--negotiate_seed', '--cb'] + list(map(add_ext, bin_names))
         if should_core:
             cb_cmd += ['--should_core']
+        if Tester.genprog_enabled:
+            cb_cmd += ['--genprog']
 
+        debug('\nrun_test: '+' '.join(cb_cmd)+'\n')
         p = subprocess.Popen(cb_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=TOOLS_DIR)
         out, err = p.communicate()
 
@@ -143,15 +152,18 @@ class Tester:
         if len(cb_dirs) > 0:
             # There are multiple binaries in this challenge
             bin_names = ['{}_{}'.format(self.name, i + 1) for i in range(len(cb_dirs))]
-        else:
+        elif not self.gpbin:
             bin_names = [self.name]
+        else:
+            bin_names = [self.gpbin]
 
         # Keep track of old pass/totals
         p, t = score.passed, score.total
 
         # Run the tests
         self.run_test(bin_names, xml_dir, score, should_core=is_pov)
-        self.run_test(['{}_patched'.format(b) for b in bin_names], xml_dir, score)
+        if not self.gpbin:
+            self.run_test(['{}_patched'.format(b) for b in bin_names], xml_dir, score)
 
         # Display resulting totals
         debug(' => Passed {}/{}\n'.format(score.passed - p, score.total - t))
@@ -195,7 +207,7 @@ def test_challenges(chal_names):
         chals.append(c)
 
     # Create and run all testers
-    testers = map(Tester, chals)
+    testers = list(map(Tester, chals))
     for test in testers:
         test.run()
 
@@ -336,6 +348,13 @@ def main():
     g.add_argument('--polls', action='store_true',
                    help='Only run tests against POLLS')
 
+    parser.add_argument('--genprog', action='store_true', default=False,
+                   help='Run in GenProg testing mode')
+
+    parser.add_argument('--genprog-bin', '--gpbin', 
+                   default=None, type=str,
+                   help='Run only this binary against test suite')
+
     parser.add_argument('-o', '--output',
                         default=None, type=str,
                         help='If provided, an excel spreadsheet will be generated and saved here')
@@ -348,6 +367,9 @@ def main():
     if args.polls:
         Tester.povs_enabled = False
 
+    Tester.genprog_enabled=args.genprog
+    Tester.gpbin=args.genprog_bin
+
     if args.all:
         debug('Running tests against all challenges\n')
         tests = test_challenges(listdir(BUILD_DIR))
@@ -358,6 +380,14 @@ def main():
     if args.output:
         generate_xlsx(os.path.abspath(args.output), tests)
 
+    failed=0
+    for i,t in enumerate(tests):
+        print("Fail count for test "+str(i)+": "+str(failed))
+        failed += t.failed
+    print("Total tests failed: "+str(failed))
+    return failed
+
 
 if __name__ == '__main__':
-    main()
+    f=main()
+    exit(f)

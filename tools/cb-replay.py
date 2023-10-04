@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 """
 CB POV / Poll communication verification tool
@@ -40,10 +40,62 @@ import time
 import threading
 import zipfile
 import defusedxml.ElementTree as ET
+import codecs
 
 from common import Timeout, TimeoutError
+from subprocess import TimeoutExpired
 import challenge_runner
 
+gen_rep_log=[False,'seed.log','replay.log','replay.out.log']
+
+test={'enabled':False,'id':None,'expected':bytearray(),'write':bytearray(),'seed':None}
+
+def enable_json_dump():
+    test['enabled']=True
+
+#def json_append_expected_data(bdata):
+#    if test['enabled']:
+#        for i in bdata:
+#            try:
+#                test['expected'].extend(i)
+#            except Exception as e:
+#                print(f"type = {type(i)}",flush=True)
+#                print(e)
+#                raise(e)
+
+def json_append_write_data(bdata):
+    if test['enabled']:
+        for i in bdata:
+            try:
+                if type(i)==bytes:
+                    test['write'].extend(i)
+                if type(i)==str:
+                    test['write'].extend(bytes(i,encoding="raw_unicode_escape"))
+            except Exception as e:
+                print(f"type = {type(i)}",flush=True)
+                print(e)
+                raise(e)
+
+def json_seed(seed):
+    if test['enabled']:
+        test['seed']=seed
+
+def json_id(idn):
+    if test['enabled']:
+        test['id']=idn
+
+def write_json():
+    if test['enabled']:
+        dest=f"{test['id']}.pkl"
+        if os.path.exists(dest):
+            os.remove(dest)
+        p=os.path.dirname(dest)
+        if p!="" and not os.path.exists(p):
+            os.makedirs(p)
+        with open(dest,'wb') as f:
+            import pickle
+            pickle.dump(test,f)
+            f.close()
 
 class RegexMatch(object):
     """ Simple wrapper for handling regexes in Throw.
@@ -122,7 +174,7 @@ class Throw(object):
 
         negotiate: Should the CB negotiation process happen
     """
-    def __init__(self, cb_paths, pov, timeout, debug, negotiate):
+    def __init__(self, cb_paths, pov, timeout, debug, negotiate, dbi=None, perf=False):
         self.cb_paths = cb_paths
         self.count = 0
         self.failed = 0
@@ -134,6 +186,8 @@ class Throw(object):
         self.logs = []
         self._read_buffer = ''
         self.negotiate = negotiate
+        self.dbi = dbi
+        self.perf = perf
 
         self.procs = None
         self.pipe_raw = []
@@ -165,6 +219,10 @@ class Throw(object):
             expected = self.values[expected]
 
         if isinstance(expected, str):
+            if result.startswith(expected):
+                self.log_ok(message)
+                return len(expected)
+        elif isinstance(expected, bytes):
             if result.startswith(expected):
                 self.log_ok(message)
                 return len(expected)
@@ -206,6 +264,10 @@ class Throw(object):
 
         if isinstance(expected, str):
             if not result.startswith(expected):
+                self.log_ok(message)
+                return len(expected)
+        elif isinstance(expected, bytes):
+            if result.startswith(expected):
                 self.log_ok(message)
                 return len(expected)
         else:
@@ -297,7 +359,7 @@ class Throw(object):
         """
         self.values.update(values)
 
-        set_values = [repr(x) for x in values.keys()]
+        set_values = [repr(x) for x in list(values.keys())]
         self.log_ok("set values: %s" % ', '.join(set_values))
 
     def _perform_match(self, match, data, invert=False):
@@ -321,6 +383,13 @@ class Throw(object):
                                           'match: not string')
                 else:
                     offset += self.is_ok(item, data[offset:], 'match: string')
+            elif isinstance(item,bytes):
+                if invert:
+                    offset += self.is_not(item, data[offset:].encode('ISO-8859-1'),
+                                          'match: not string')
+                else:
+                    offset += self.is_ok(item, data[offset:].encode('ISO-8859-1'), 
+                                         'match: string')
             elif hasattr(item, 'match'):
                 match = item.match(data[offset:])
                 if match:
@@ -396,16 +465,21 @@ class Throw(object):
         data_len = len(self._read_buffer)
         while data_len < read_len:
             left = read_len - data_len
+            if self.debug:
+                self.log("#bytes left >>{}<<".format(left)) 
             data_read = self.read_from_proc(max(4096, left))
+            if self.debug:
+                self.log("read_len: >>{}<<".format(data_read)) 
             if len(data_read) == 0:
                 # data_read = '\n'
                 self.log_fail('recv failed. (%s so far)' % repr(data))
-                self._read_buffer = ''.join(data)
+                self._read_buffer = b''.join(data)
                 return ''
 
             data.append(data_read)
             data_len += len(data_read)
-
+        if self.debug:
+            self.log("read: >>{}<<".format(data))
         data = ''.join(data)
         self._read_buffer = data[read_len:]
         return data[:read_len]
@@ -415,8 +489,10 @@ class Throw(object):
         Read until a delimiter is found, but only ever get 4096 bytes from the
         socket
         """
+        delim=delim.decode('ISO-8859-1')
         while delim not in self._read_buffer:
             data_read = self.read_from_proc(4096)
+            #print("# _read_delim : data_read = {} [delim={}]".format(data_read,delim))
             if len(data_read) == 0:
                 self.log_fail('recv failed.  No data returned.')
                 return ''
@@ -442,10 +518,13 @@ class Throw(object):
         data = ''
         try:
             if 'length' in read_args:
+                #print("length = {}".format(read_args['length']))
                 data = self._read_len(read_args['length'])
                 self.is_ok(read_args['length'], len(data), 'read length')
             elif 'delim' in read_args:
                 data = self._read_delim(read_args['delim'])
+            if self.debug:
+                self.log('received %s' % data)
         except socket.error as err:
             self.log_fail('recv failed: %s' % str(err))
 
@@ -479,14 +558,17 @@ class Throw(object):
         """
         data = []
         for value in args['value']:
+            v = value
             if isinstance(value, _ValueStr):
                 if value not in self.values:
                     self.log_fail('write failed: %s not available' % value)
                     return
-                data.append(self.values[value])
-            else:
-                data.append(value)
-        to_send = ''.join(data)
+                v = self.values[value]
+            if isinstance(v,str):
+                v = v.encode('ISO-8859-1')
+            data.append(v)
+        to_send = b''.join(data)
+        #self.log('sending "%s"' % to_send )
 
         if self.debug:
             if args['echo'] == 'yes':
@@ -515,7 +597,13 @@ class Throw(object):
             (int): amount of data written, or 0 on error
         """
         try:
-            self.procs[0].stdin.write(data)
+            #self.procs[0].stdin.write(data.encode())
+            #x=data.encode('utf-8')
+            #x=data.encode('ISO-8859-1')
+            x=data
+            #print("type(self.procs[0])={} [x={}]".format(type(self.procs[0]),x),flush=True)
+            self.procs[0].stdin.write(x)
+            self.procs[0].stdin.flush()
             return len(data)
         except IOError:
             return 0
@@ -531,16 +619,18 @@ class Throw(object):
         """
         # Wait until there's data in the raw buffer
         while len(self.pipe_raw) == 0:
-            time.sleep(0.1)
+            time.sleep(0.01)
 
         # Fill up the temp buffer until we have the requested amount of data
         while len(self.pipe_buf) < size and len(self.pipe_raw) != 0:
-            self.pipe_buf += self.pipe_raw.pop(0)
+            #self.pipe_buf += self.pipe_raw.pop(0).decode('ascii')
+            self.pipe_buf += self.pipe_raw.pop(0).decode('ISO-8859-1')
 
             # Convert CRLF to LF to match what the POLLs expect
             if self.pipe_buf.endswith('\r\n'):
                 self.pipe_buf = self.pipe_buf[:-2] + '\n'
 
+        #print("read_from_proc: >>{}<<".format(self.pipe_buf),end='')
         # Return the amount requested
         res = self.pipe_buf[:size]
         self.pipe_buf = self.pipe_buf[size:]
@@ -557,7 +647,7 @@ class Throw(object):
         """
         while True:
             c = pipe.read(1)
-            if c in [None, '']:
+            if c in [None, b'']:
                 break
             self.pipe_raw.append(c)
 
@@ -566,12 +656,22 @@ class Throw(object):
         seed = self.pov.seed
 
         if seed is None:
-            print "# No seed specified, using random seed"
-            seed = os.urandom(48)
+            print("# No seed specified, using random seed")
+            seed = int.from_bytes(os.urandom(48),byteorder='little')
+            self.log("random seed: %s" % hex(seed))
 
-        self.log("using seed: %s" % seed.encode('hex'))
-        return seed.encode('hex')
+        #self.log("using seed: %s" % seed.encode('hex'))
+        #return seed.encode('hex')
+        seed_val=hex(seed)[2:].zfill(96)
+        self.log("using seed: %s" % seed_val)
+        json_seed(seed_val)
+        return seed_val
 
+    def kill_procs(self):
+        proc = self.procs[0]
+        proc.wait(timeout=1)
+        proc.kill()
+        
     def run(self):
         """ Iteratively execute each of the actions within the POV
 
@@ -598,7 +698,23 @@ class Throw(object):
         seed = self.gen_seed()
 
         # Launch all challenges
-        self.procs, watcher = challenge_runner.run(self.cb_paths, self.timeout, seed, self.log)
+        challenges=self.cb_paths
+        if self.dbi:
+           for i,x in enumerate(challenges):
+                challenges[i]=self.dbi+" "+os.path.abspath(x)
+           self.log('DBI challenge: '+challenges[0])
+        elif self.perf:
+           for i,x in enumerate(challenges):
+                # please note that the performance output is sent to STDERR, not STDOUT
+                challenges[i]="/usr/bin/perf stat "+os.path.abspath(x)
+           self.log('Obtaining run-time for: '+challenges[0])
+
+        #PEMMA
+        if gen_rep_log:
+            o=open(gen_rep_log[1],"wb")
+            o.write(bytes(seed,'utf-8'))
+        self.procs, watcher = challenge_runner.run(challenges, self.timeout, seed, self.log,\
+                               True )
 
         # Start a thread to buffer data from the challenges' stdout
         buf_thread = threading.Thread(target=self.buffer_pipe_data, args=(self.procs[0].stdout,))
@@ -609,6 +725,7 @@ class Throw(object):
         for method, arguments in self.pov:
             assert method in methods, "%s not in methods" % method
             try:
+                #self.log("[method : {}][arguments : {}]".format(method,arguments))
                 methods[method](arguments)
             except TestFailure:
                 self.log('stopping due to failure')
@@ -616,12 +733,26 @@ class Throw(object):
 
         # The current test is done, kill the main process if it's still running
         proc = self.procs[0]
-        if proc.poll() is None:
-            proc.terminate()
+        retval = proc.poll()
+        if retval is None:
+            try:
+                proc.wait(timeout=1)
+            except TimeoutExpired:
+                self.log('terminating proc')
+                proc.terminate()
 
         # Wait for the watcher to report its results
         buf_thread.join()
         watcher.join()
+        if buf_thread.is_alive():
+            self.log('buf_thread is alive')
+        else:
+            self.log('buf_thread is dead')
+        if watcher.is_alive():
+            self.log('watcher is alive')
+        else:
+            self.log('watcher is dead')
+
 
     def dump(self):
         """ Log information for the current POV iteraction
@@ -705,7 +836,8 @@ class POV(object):
         """
         for i in [' ', '\n', '\r', '\t']:
             data = data.replace(i, '')
-        return data.decode('hex')
+        #return data.decode('hex')
+        return bytes.fromhex(data).decode('ISO-8859-1')
 
     @staticmethod
     def compile_pcre(data):
@@ -763,6 +895,7 @@ class POV(object):
             Exception: if the escaped value is not one of the supported escaped
                 strings (See above)
         """
+
         # \\, \r, \n, \t \x(HEX)(HEX)
         data = str(data)  # no unicode support
         state = 0
@@ -773,12 +906,12 @@ class POV(object):
         for val in data:
             if state == 0:
                 if val != '\\':
-                    out.append(val)
+                    out.append(val.encode('ISO-8859-1'))
                     continue
                 state = 1
             elif state == 1:
                 if val in chars:
-                    out.append(chars[val])
+                    out.append(chars[val].encode('ISO-8859-1'))
                     state = 0
                     continue
                 elif val == 'x':
@@ -792,10 +925,16 @@ class POV(object):
             else:
                 assert val.lower() in hex_chars
                 hex_tmp += val
-                out.append(hex_tmp.decode('hex'))
+                #print(hex_tmp,end='')
+                #out.append(hex_tmp.decode('hex'))
+                #out.append(str(int(hex_tmp,16)))
+                #out.append(bytes.fromhex(hex_tmp).decode('utf-8'))
+                out.append(bytes.fromhex(hex_tmp))
                 hex_tmp = ''
                 state = 0
-        return ''.join(out)
+        x= b''.join(out)
+        #print("in => {}; out => {}".format(data,x))
+        return x
 
     @staticmethod
     def compile_string(data_type, data):
@@ -1029,7 +1168,9 @@ class POV(object):
 
         assert len(data) > 0
 
-        children = data.getchildren()
+        #children = data.getchildren()
+        children = list(data)
+
 
         read_until = children.pop(0)
 
@@ -1067,6 +1208,33 @@ class POV(object):
                                     item.name)
 
             read_args['match'] = {'invert': invert, 'values': values}
+            #json_append_expected_data(values)
+            if gen_rep_log:
+                try:
+                    o=open(gen_rep_log[3],"ab")
+                    bvalues=bytearray()
+                    #print(f"values length = {len(values)} [type={type(values)}]")
+                    #print(f"Values = '{values[0]}' (type = {type(values[0])}")
+                    for v in values:
+                        if isinstance(v,str): 
+                            vvv=v.encode('ISO-8859-1')
+                            o.write(vvv)
+                        elif isinstance(v,bytes): 
+                            o.write(v)
+                    #try:
+                    #    if (type(bvalues[0])==str):
+                    #        o.write((b' '.join(bvalues)).decode('ISO-8859-1'))
+                    #    else:
+                    #        #o.write((b' '.join(values)).decode('ascii'))
+                    #        o.write((b' '.join(bvalues)).decode('ISO-8859-1'))
+                    #except:
+                    o.close()
+                except Exception as ex:
+                    print("Exception while trying to write 'replay.out.log'")
+                    #print(f"BValues = {[(b,type(b)) for b in bvalues]}")
+                    #print(f"Values = {[(b,type(b)) for b in values]}")
+                    print(ex)
+                    pass
 
             if len(children) == 0:
                 return
@@ -1132,17 +1300,45 @@ class POV(object):
         # self._add_variables(name)
 
         values = []
+        printmevalues = []
         assert len(data) > 0
         for val in data:
             if val.tag == 'data':
                 values.append(self.parse_data(val))
+                printmevalues.append(self.parse_data(val))
             else:
                 assert val.tag == 'var'
                 assert self.has_variable(val.text)
                 values.append(_ValueStr(val.text))
+                printmevalues.append("_ValueStr({})".format(val.text))
 
         echo = POV.get_attribute(data, 'echo', 'no', ['yes', 'no', 'ascii'])
         self.add_step('write', {'value': values, 'echo': echo})
+        json_append_write_data(values)
+        if gen_rep_log:
+            try:
+                o=open(gen_rep_log[2],"ab")
+                i,v = (None,None)
+                try:
+                    for v in printmevalues:
+                        if isinstance(v,str): 
+                            vvv=v.encode('ISO-8859-1')
+                            o.write(vvv)
+                        elif isinstance(v,bytes): 
+                            o.write(v)
+                    #if (type(printmevalues[0])==str):
+                    #if isinstance(printmevalues[0],bytes):
+                    #    o.write(b' '.join(printmevalues))
+                    #    #o.write((b' '.join(printmevalues)).decode('ISO-8859-1'))
+                    #else:
+                    #    o.write((' '.join(printmevalues)).encode('ISO-8859-1'))
+                except Exception as e:
+                    print("[values] Exception {}\nvalues = {},type(value[0])={}".format(e,printmevalues,type(printmevalues[0])))
+                o.close()
+            except Exception as ex:
+                print("[replay.log] Exception while trying to write 'replay.log'")
+                print(ex)
+                pass
 
     def parse(self, raw_data, filename=None):
         """ Parse the specified replay XML
@@ -1191,8 +1387,9 @@ class POV(object):
             seed = seed_tree.text
             assert len(seed) == 96
             if self.seed is not None:
-                print "# Seed is set by XML and command line, using XML seed"
-            self.seed = seed.decode('hex')
+                print("# Seed is set by XML and command line, using XML seed")
+            #self.seed = seed.decode('hex')
+            self.seed = int(seed,16)
 
         parse_fields = {
             'decl': self.parse_decl,
@@ -1203,6 +1400,7 @@ class POV(object):
 
         for replay_element in replay_tree:
             assert replay_element.tag in parse_fields
+            #print("call : {}".format(parse_fields[replay_element.tag].__name__))
             parse_fields[replay_element.tag](replay_element)
 
     def dump(self):
@@ -1218,7 +1416,7 @@ class POV(object):
             None
         """
         for step in self._steps:
-            print repr(step)
+            print(repr(step))
 
 
 class Results(object):
@@ -1243,17 +1441,26 @@ class Results(object):
         Raises:
             None
         """
-        got_passed, got_failed, got_logs = results
-        print '\n'.join(got_logs + ['END REPLAY'])
+        got_passed, got_failed, got_logs, returncodes = results
+        print('\n'.join(got_logs + ['END REPLAY']))
         self.passed += got_passed
         self.failed += got_failed
+    # SIGILL is 4, SIGTERM is 11, signals 32,33 don't exist
+        fatals=[4,11,33,124,125,126,127]; 
+        for i in range(len(fatals)):
+           if fatals[i] <= 255:
+               fatals.append(fatals[i]+128)
+        sig_okay = [i for i in range(256) if i not in fatals]
+        failed=any([abs(stat) not in sig_okay for stat in returncodes])
         if got_failed > 0:
+            self.errors += 1
+        elif failed:
             self.errors += 1
         else:
             self.full_passed += 1
 
 
-def run_pov(cbs, pov_info, timeout, debug, negotiate, cb_seed, munge_seed):
+def run_pov(cbs, pov_info, timeout, debug, negotiate, cb_seed, munge_seed, dbi=None):
     """
     Parse and Throw a POV/Poll
 
@@ -1289,7 +1496,13 @@ def run_pov(cbs, pov_info, timeout, debug, negotiate, cb_seed, munge_seed):
     if munge_seed:
         pov.mutate_seed()
 
-    thrower = Throw(cbs, pov, timeout, debug, negotiate)
+    cbs_timeout=timeout
+    if dbi:
+        cbs_timeout = 5*timeout
+    thrower = Throw(cbs, pov, cbs_timeout, debug, negotiate, dbi)
+    run_timeout=timeout
+    if dbi:
+        run_timeout = 50*timeout
     if error is not None:
         try:
             thrower.log_fail(error)
@@ -1297,18 +1510,20 @@ def run_pov(cbs, pov_info, timeout, debug, negotiate, cb_seed, munge_seed):
             pass  # log_fail throws an exception on purpose
     else:
         try:
-            with Timeout(timeout):
+            with Timeout(run_timeout):
                 thrower.run()
         except TimeoutError:
             try:
                 thrower.log_fail('pov timed out')
+                thrower.kill_procs()
             except TestFailure:
+                thrower.kill_procs()
                 # this exception should always happen.  don't stop because
                 # one timed out.
                 pass
         thrower.dump()
 
-    return thrower.passed, thrower.failed, thrower.logs
+    return thrower.passed, thrower.failed, thrower.logs, [x.returncode for x in thrower.procs]
 
 
 def main():
@@ -1328,14 +1543,40 @@ def main():
     parser.add_argument('--failure_ok', required=False, action='store_true',
                         default=False,
                         help='Failures for this test are accepted')
+    parser.add_argument('--id',dest='id',required=False, type=str, help="id for pickle content to store test info")
     parser.add_argument('--debug', required=False, action='store_true',
                         default=False, help='Enable debugging output')
+    parser.add_argument('--perf', required=False, action='store_true',
+                        default=False, help='Capture run-time performance for CB')
     parser.add_argument('--negotiate', required=False, action='store_true',
                         default=False, help='The CB seed should be negotiated')
     parser.add_argument('--cb_seed', required=False, type=str,
                         help='Specify the CB Seed')
 
+    parser.add_argument('--replay', required=False, action='store_true',
+                        default=False, help='generate replay.log and replay.out.log')
+
+    parser.add_argument('--dbi', required=False, type=str, default=None, 
+    help='Specify any dynamic binary instrumentation (like valgrind) to be prepended to executable under test\
+    e.g. --dbi "/usr/bin/valgrind --tool=callgrind --log-file=tramp.cg.log --callgrind-out-file=tramp.cg.out"')
+
+
     args = parser.parse_args()
+    if args.debug:
+        print(f"Running {args.cbs} in debug mode")
+    if args.id:
+        enable_json_dump()
+
+    global gen_rep_log
+    gen_rep_log[0]=args.replay
+    if gen_rep_log[0]:
+        o=open(gen_rep_log[1],"wb")
+        o.close()
+        o=open(gen_rep_log[2],"wb")
+        o.close()
+        o=open(gen_rep_log[3],"wb")
+        o.close()
+
 
     assert args.concurrent > 0, "Conccurent count must be less than 1"
 
@@ -1364,7 +1605,8 @@ def main():
     try:
         for pov in povs:
             pov_args = (args.cbs, pov, args.timeout, args.debug,
-                        args.negotiate, args.cb_seed, args.munge_seed)
+                        args.negotiate, args.cb_seed, args.munge_seed, 
+                        args.dbi)
             if args.concurrent > 1:
                 pool_response = pool.apply_async(run_pov, args=pov_args,
                                                  callback=result_handler.cb_pov_result)
@@ -1376,19 +1618,27 @@ def main():
             response.get()
 
     except KeyboardInterrupt:
-        print "# Interrupted.  Logging as error"
+        print("# Interrupted.  Logging as error")
         result_handler.errors += 1
         if args.concurrent > 1:
+            ##pool.kill()
+            #for p in pool._pool:
+            #    os.kill(p.pid,signal.SIGKILL)
+            #while any(p.is_alive() for p in pool._pool):
+            #    pass
             pool.terminate()
     finally:
         if args.concurrent > 1:
             pool.close()
             pool.join()
 
-    print "# total tests passed: %d" % result_handler.passed
-    print "# total tests failed: %d" % result_handler.failed
-    print "# polls passed: %d" % result_handler.full_passed
-    print "# polls failed: %d" % result_handler.errors
+    print("# total tests passed: %d" % result_handler.passed)
+    print("# total tests failed: %d" % result_handler.failed)
+    print("# polls passed: %d" % result_handler.full_passed)
+    print("# polls failed: %d" % result_handler.errors)
+
+    json_id(args.id)
+    write_json()
 
     if args.failure_ok:
         return 0

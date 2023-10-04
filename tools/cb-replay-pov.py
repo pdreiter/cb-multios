@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 """
 CB POV / Poll communication verification tool
@@ -37,6 +37,7 @@ import os
 import signal
 import struct
 import threading
+import codecs
 
 from common import IS_WINDOWS, Timeout, TimeoutError
 import challenge_runner
@@ -87,15 +88,17 @@ class Throw(object):
 
         timeout: connection timeout
     """
-    def __init__(self, cb_paths, pov, timeout, debug, pov_seed):
+    def __init__(self, cb_paths, pov, timeout, debug, pov_seed, dbi=None):
         self.cb_paths = cb_paths
         self.pov = pov
         self.debug = debug
         self.timeout = timeout
         self.pov_seed = pov_seed
+        self.dbi = dbi
+        self.returncode = None
 
     def log(self, data):
-        print "# %s" % data
+        print("# %s" % data)
 
     def count_bits_set(self, value):
         count = 0
@@ -105,11 +108,17 @@ class Throw(object):
         return count
 
     def read_all(self, fd, data_len):
-        data = ''
+        data = b''
+        if self.debug:
+            self.log('read_all')
         while len(data) < data_len:
             read = os.read(fd, data_len - len(data))
             assert len(read)
             data += read
+            if self.debug:
+                self.log('read: {}'.format(read))
+        if self.debug:
+            self.log('data: {}'.format(data))
         return data
 
     def pov_negotiate(self, pipefd):
@@ -163,7 +172,8 @@ class Throw(object):
             if self.debug:
                 self.log("getting secret")
             data = self.read_all(pipefd, 4)
-            self.log("secret value: %s" % data.encode('hex'))
+            #self.log("secret value: %s" % data.encode('hex'))
+            self.log("secret value: %s" % codecs.encode(data,'hex'))
 
         if self.debug:
             self.log('done')
@@ -175,7 +185,9 @@ class Throw(object):
             signal.alarm(self.timeout)
 
         # Setup fds for communication
+        # executable under test's stdout goes to STDIN
         os.dup2(mainproc.stdout.fileno(), 0)
+        # executable under test's stdin goes to STDOUT
         os.dup2(mainproc.stdin.fileno(), 1)
         os.dup2(pipe.fileno(), 3)
 
@@ -190,6 +202,8 @@ class Throw(object):
 
         # Launch the POV
         os.execv(self.pov, args)
+        #stdout2file.close()
+        #exe2file.close()
         exit(-1)
 
     def _launch_pov_win(self, mainproc, pipe):
@@ -235,8 +249,10 @@ class Throw(object):
     def gen_seed(self):
         """ Prepare the seed that will be used in the replay """
         seed = os.urandom(48)
-        self.log("using seed: %s" % seed.encode('hex'))
-        return seed.encode('hex')
+        #self.log("using seed: %s" % seed.encode('hex'))
+        self.log("using seed: %s" % codecs.encode(seed, 'hex').decode('ascii'))
+        #return seed.encode('hex')
+        return codecs.encode(seed,'hex')
 
     def run(self):
         """ Iteratively execute each of the actions within the POV
@@ -256,20 +272,48 @@ class Throw(object):
         seed = self.gen_seed()
 
         # Launch the challenges
-        self.procs, watcher = challenge_runner.run(self.cb_paths, self.timeout, seed, self.log)
+        challenges=self.cb_paths
+        if self.dbi:
+           for i,x in enumerate(challenges):
+                challenges[i]=self.dbi+" "+os.path.abspath(x)
+        self.procs, watcher = challenge_runner.run(challenges, self.timeout, seed, self.log)
 
         # Setup and run the POV
         pov_pipes = mp.Pipe(duplex=True)
+
+        #chal_pipes = mp.Pipe(duplex=True)
+        # Start a thread to buffer data from the challenges' stdout
+        #outbuf_thread = threading.Thread(target=self.buffer_pipe_data, args=(chal_pipes[0],pov_pipes[1],"replay.pov.out.log",))
+        #outbuf_thread.setDaemon(True)
+        #outbuf_thread.start()
+        #inbuf_thread = threading.Thread(target=self.buffer_pipe_data, args=(pov_pipes[1],chal_pipes[0],"replay.pov.log",))
+        #inbuf_thread.setDaemon(True)
+        #inbuf_thread.start()
+        
+        #pov_runner = self.launch_pov(self.procs[0], chal_pipes[1])
         pov_runner = self.launch_pov(self.procs[0], pov_pipes[1])
 
+        pov_negotiate_fail=False
         if self.timeout > 0:
-            try:
-                with Timeout(self.timeout + 5):
-                    self.pov_negotiate(get_fd(pov_pipes[0]))
-            except TimeoutError:
+            neg_thread = threading.Thread(target=self.pov_negotiate, args=(get_fd(pov_pipes[0]),))
+            neg_thread.daemon=True
+            neg_thread.start()
+            neg_thread.join(self.timeout)
+       
+            if neg_thread.is_alive():
                 self.log('pov negotiation timed out')
-        else:
-            self.pov_negotiate()
+                pov_negotiate_fail=True
+            
+        #if self.timeout > 0:
+        #    try:
+        #        with Timeout(self.timeout + 1):
+        #            self.pov_negotiate(get_fd(pov_pipes[0]))
+        #    except TimeoutError:
+        #        self.log('pov negotiation timed out')
+        #        pass
+        #else:
+        #    self.log("No negotiation needed?")
+        #    self.pov_negotiate()
 
         if self.debug:
             self.log('waiting')
@@ -279,10 +323,49 @@ class Throw(object):
         watcher.join()
 
         self.log('END REPLAY')
-        return self.procs[0].returncode
+
+        proc = self.procs[0]
+        retval = proc.poll()
+        self.returncode=self.procs[0].returncode
+        #self.log("pov_runner.exitcode = {}".format(pov_runner.exitcode))
+        #self.log("watcher.is_alive() = {}".format(watcher.is_alive()))
+
+        if retval is None:
+            try:
+                proc.wait(timeout=1)
+            except TimeoutExpired:
+                self.log('terminating proc')
+                proc.terminate()
+        else:
+            self.returncode=retval
+
+        # Wait for the watcher to report its results
+        #return self.procs[0].returncode
+        ret=( self.returncode, pov_runner.exitcode, pov_negotiate_fail)
+        self.log("binary return code, pov exit code, pov negotiation fail= "+str(ret))
+        return ret
+
+    def buffer_pipe_data(self, pipe_in, pipe_out,logfile):
+        """ Continuously reads and buffers data from a pipe
+
+        This will block when attempting to read data and should be run
+        in a separate thread
+
+        Args:
+            pipe: readable fileobject for a pipe
+        """
+        o=open(logfile,"wb")
+        while True:
+            c = pipe_in.recv_bytes(1)
+            if c in [None, b'']:
+                break
+            o.write(c)
+            pipe_out.send_bytes(c)
 
 
-def run_pov(cbs, pov, timeout, debug, pov_seed):
+
+
+def run_pov(cbs, pov, timeout, debug, pov_seed, dbi):
     """
     Parse and Throw a POV/Poll
 
@@ -303,7 +386,7 @@ def run_pov(cbs, pov, timeout, debug, pov_seed):
         Exception if parsing the POV times out
     """
 
-    thrower = Throw(cbs, pov, timeout, debug, pov_seed)
+    thrower = Throw(cbs, pov, timeout, debug, pov_seed, dbi)
     return thrower.run()
 
 
@@ -324,16 +407,44 @@ def main():
     parser.add_argument('--pov_seed', required=False, type=str,
                         help='Specify the POV Seed')
 
+    parser.add_argument('--sigok', required=False, action="append", type=int,
+                        help='Specify signal values that are okay to terminate with')
+
+    parser.add_argument('--dbi', required=False, type=str, default=None, 
+    help='Specify any dynamic binary instrumentation (like valgrind) to be prepended to executable under test\
+	e.g. --dbi "/usr/bin/valgrind --tool=callgrind --log-file=tramp.cg.log --callgrind-out-file=tramp.cg.out"')
+
+
+
     args = parser.parse_args()
+	# SIGILL is 4, SIGTERM is 11, signals 32,33 don't exist
+    #fatals=[4,11,32,33,124,125,126,127]; 
+    fatals=[4,11,33,124,125,126,127]; 
+    for i in range(len(fatals)):
+       if fatals[i] <= 255:
+           fatals.append(fatals[i]+128)
+    sig_okay = [i for i in range(256) if i not in fatals]
+    if args.sigok:
+        sig_okay.extend(args.sigok)
 
     assert len(args.files)
     for filename in args.files:
         assert os.path.isfile(filename), "pov must be a file: %s" % repr(filename)
 
+    status=list()
+    seed = None
+    if args.dbi:
+        args.timeout=5*args.timeout
+    if args.pov_seed:
+        seed=codecs.encode(seed,'hex')
     for pov in args.files:
-        status = run_pov(args.cbs, pov, args.timeout,
-                         args.debug, args.pov_seed)
-    return status != 0
+        stat,pov_stat,negot_failed = run_pov(args.cbs, pov, args.timeout,
+                         args.debug, seed,args.dbi)
+        exe_status= abs(stat) not in sig_okay
+        pov_status= abs(pov_stat) not in sig_okay
+        status.append(exe_status or pov_status or negot_failed)
+    
+    return any(status)
 
 
 if __name__ == "__main__":

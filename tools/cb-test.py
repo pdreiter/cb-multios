@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 """
 CB Testing tool
@@ -37,9 +37,9 @@ import signal
 import subprocess
 import sys
 import time
-import thread
+import _thread
 import threading
-import Queue
+import queue
 import ansi_x931_aes128
 
 from common import IS_WINDOWS
@@ -71,11 +71,11 @@ class Background(object):
             self.cmd = cmd[0]
         else:
             self.cmd = command_name
-        # print("RUNNING : " + cmd[0])
+        print(("RUNNING : " + cmd[0]))
         self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE)
         self.threads = []
-        self.log_queue = Queue.Queue()
+        self.log_queue = queue.Queue()
         self.log_handle(self.process.stdout, False)
         self.log_handle(self.process.stderr, True)
 
@@ -113,7 +113,7 @@ class Background(object):
                 log.close()
                 queue.put(None)
             except KeyboardInterrupt:
-                thread.interrupt_main()
+                _thread.interrupt_main()
 
         my_thread = threading.Thread(target=log_background,
                                      args=(filehandle, should_repr, self.log_queue))
@@ -201,14 +201,15 @@ class Runner(object):
         pov_seed: the PRNG seed for POVs
         cb_no_attach: Should the CB not be attached within cb-server
     """
-    pov_signals = [signal.SIGSEGV, signal.SIGILL]
+    #pov_signals = [signal.SIGSEGV, signal.SIGILL] #, signal.SIGKILL]
+    pov_signals = [signal.SIGSEGV, signal.SIGILL, signal.SIGKILL]
     if not IS_WINDOWS:
         pov_signals.append(signal.SIGBUS)
 
     def __init__(self, port, cb_list, xml_list, pcap, wrapper, directory,
                  should_core, failure_ok, should_debug, timeout, log_fh,
                  cb_seed, cb_seed_skip, max_send, concurrent, negotiate_seed,
-                 pov_seed, cb_no_attach):
+                 pov_seed, cb_no_attach, genprog_enabled):
         self.port = port
         self.cb_list = cb_list
         self.cb_no_attach = cb_no_attach
@@ -228,6 +229,7 @@ class Runner(object):
         self.max_send = max_send
         self.negotiate_seed = negotiate_seed
         self.pov_seed = pov_seed
+        self.genprog_enabled=genprog_enabled
 
         if not IS_WINDOWS:
             resource.setrlimit(resource.RLIMIT_CORE, (resource.RLIM_INFINITY,
@@ -269,12 +271,12 @@ class Runner(object):
                                    stderr=subprocess.PIPE)
         stdout, stderr = process.communicate()
         if len(stderr):
-            for line in stderr.split('\n'):
+            for line in stderr.decode('ISO-8859-1').split('\n'):
                 logging.error('%s (stderr): %s', cmd[0], repr(line))
         self.log_fh.flush()
-        self.log_fh.write(stdout)
+        self.log_fh.write(stdout.decode('ISO-8859-1'))
         self.log_fh.flush()
-        return process.returncode, stdout
+        return process.returncode, stdout.decode('ISO-8859-1')
 
     def cleanup(self):
         """ Cleanup the current enviornment.
@@ -311,7 +313,7 @@ class Runner(object):
             import apt
             cache = apt.Cache()
             cgc_packages = []
-            for package_name in cache.keys():
+            for package_name in list(cache.keys()):
                 if 'cgc' not in package_name:
                     continue
                 package = cache[package_name]
@@ -340,7 +342,7 @@ class Runner(object):
         Raises:
             None
         """
-        for name, value in signal.__dict__.iteritems():
+        for name, value in signal.__dict__.items():
             if sig_id == value:
                 return name
         return 'UNKNOWN'
@@ -358,10 +360,11 @@ class Runner(object):
             None
         """
         cb_paths = [os.path.join(self.directory, cb) for cb in self.cb_list]
+        bin_path = os.path.dirname(os.path.realpath(__file__))
 
-        replay_bin = os.path.join('.', 'cb-replay.py')
+        replay_bin = os.path.join(bin_path, 'cb-replay.py')
         if xml[0].endswith(add_ext('.pov')):
-            replay_bin = os.path.join('.', 'cb-replay-pov.py')
+            replay_bin = os.path.join(bin_path, 'cb-replay-pov.py')
 
         replay_cmd = [sys.executable, replay_bin, '--debug', '--cbs'] + cb_paths
 
@@ -373,13 +376,13 @@ class Runner(object):
             if self.cb_seed is not None:
                 replay_cmd += ['--cb_seed', self.cb_seed]
 
-        if self.pov_seed and replay_bin == os.path.join('.', 'cb-replay-pov.py'):
+        if self.pov_seed and replay_bin == os.path.join(bin_path, 'cb-replay-pov.py'):
             replay_cmd += ['--pov_seed', self.pov_seed]
 
         if self.should_debug:
             replay_cmd += ['--debug']
 
-        if replay_bin == os.path.join('.', 'cb-replay.py'):
+        if replay_bin == os.path.join(bin_path, 'cb-replay.py'):
             if self.failure_ok:
                 replay_cmd += ['--failure_ok']
 
@@ -390,10 +393,66 @@ class Runner(object):
             replay_cmd += ['--max_send', '%d' % self.max_send]
 
         replay_cmd += xml
-
+        print(("\nreplay_cmd: "+' '.join(replay_cmd)))
         return self.launch(replay_cmd)
 
+    def start_genprog_replay(self, xml):
+        """ Start cb-replay
+
+        Arguments:
+            None
+
+        Returns:
+            Number of passing tests
+
+        Raises:
+            None
+        """
+        cb_paths = [os.path.join(self.directory, cb) for cb in self.cb_list]
+        bin_path = os.path.dirname(os.path.realpath(__file__))
+
+        replay_bin = os.path.join(bin_path, 'cb-replay.py')
+        if xml[0].endswith(add_ext('.pov')):
+            replay_bin = os.path.join(bin_path, 'cb-replay-pov.py')
+
+        replay_cmd = [sys.executable, replay_bin, '--debug', '--cbs'] + cb_paths
+
+        if self.timeout > 0:
+            replay_cmd += ['--timeout', '%d' % self.timeout]
+
+        if self.negotiate_seed:
+            replay_cmd += ['--negotiate']
+            if self.cb_seed is not None:
+                replay_cmd += ['--cb_seed', self.cb_seed]
+
+        if self.pov_seed and replay_bin == os.path.join(bin_path, 'cb-replay-pov.py'):
+            replay_cmd += ['--pov_seed', self.pov_seed]
+
+        if self.should_debug:
+            replay_cmd += ['--debug']
+
+        if replay_bin == os.path.join(bin_path, 'cb-replay.py'):
+            if self.failure_ok:
+                replay_cmd += ['--failure_ok']
+
+            if self.concurrent:
+                replay_cmd += ['--concurrent', '%d' % self.concurrent]
+
+        if self.max_send is not None and self.max_send > 0:
+            replay_cmd += ['--max_send', '%d' % self.max_send]
+
+        #replay_cmd += xml
+        passed_tests=0
+        for i,x in enumerate(xml):
+           if i != passed_tests:
+              return passed_tests
+           new_replay_cmd = replay_cmd + [x]
+           replay_result = self.launch(new_replay_cmd)
+           passed_tests += self.check_single_result(replay_result, x)
+        return passed_tests
+
     def _check_result_cqe(self, sig, ret):
+        logging.warning("[sig:{},ret:{}]".format(sig,ret))
         # if sig == signal.SIGALRM:
         #     if self.failure_ok:
         #         logging.warning('ok - process timed out', extra={'raw': True})
@@ -421,6 +480,7 @@ class Runner(object):
         return ret
 
     def _check_result_type1(self, sig, replay_stdout):
+        logging.warning("[sig:{}]".format(sig))
         if sig == 0:
             if self.should_core:
                 logging.error('not ok - POV type 1 should have cored, and did not.', extra={'raw': True})
@@ -518,7 +578,17 @@ class Runner(object):
 
             seed = match.group(1)
 
-        prng = ansi_x931_aes128.PRNG(seed.decode('hex'))
+        #prng = ansi_x931_aes128.PRNG(seed.decode('hex'))
+        #logging.warning("seed = {} (length = {}; type = {})".format(seed,len(seed),type(seed)))
+        #logging.warning("int(seed,16) = {}".format(int(seed,16)))
+        #logging.warning("hex(int(seed,16)) = {}".format(hex(int(seed,16))))
+        #logging.warning("bytes.fromhex(seed) = {}".format(bytes.fromhex(seed)))
+        #logging.warning("bytes.fromhex(seed).decode('ISO-8859-1') = {}".format(bytes.fromhex(seed).decode('ISO-8859-1')))
+        #logging.warning("bytearray.fromhex(seed) = {}".format(bytearray.fromhex(seed)))
+        prng = ansi_x931_aes128.PRNG(bytearray.fromhex(seed))
+        # doesn't work
+        #import codecs
+        #prng = ansi_x931_aes128.PRNG(codecs.encode(seed,'hex'))
         flag_page = prng.get(0x1000)
 
         match = re.search(r'secret value: ([a-fA-F0-9]+)', replay_stdout)
@@ -530,7 +600,10 @@ class Runner(object):
                 logging.warning('ok - POV type 2 did not return a secret value as expected', extra={'raw': True})
                 return 0
 
-        value = match.group(1).decode('hex')
+        #value = match.group(1).decode('hex')
+        #logging.warning("match.group(1)='{}' [{}]".format(match.group(1),len(match.group(1))))
+        glen=len(match.group(1)) if len(match.group(1))%2 else len(match.group(1))+1
+        value = int(match.group(1),16).to_bytes(glen,'little')
         if value not in flag_page:
             if not self.should_core:
                 logging.warning('ok - POV type 2 secret value is not part of the secret page (as expected)',
@@ -552,6 +625,7 @@ class Runner(object):
             return -1
 
         pov_type = int(match.group(1))
+        #print("pov_type : "+str(pov_type))
         if pov_type not in [1, 2]:
             logging.error("not ok - pov negotation is not 1 or 2: %d\n" % pov_type, extra={'raw': True})
             return -1
@@ -589,18 +663,72 @@ class Runner(object):
             sig = 0
             sig_re = r'Process generated signal.+signal: (\d+)\)'
             match = re.search(sig_re, xml_replay_stdout)
+            sig_re2 = r' sig: (\d+)'
+            match2 = re.search(sig_re2, xml_replay_stdout)
             if match:
                 sig = int(match.group(1))
+            elif match2:
+                sig = int(match2.group(1))
+                # making this behave like Python2
+                if sig == 15:
+                    sig=0
+            else:
+                print("xml_replay_stdout:\n[{}]".format(xml_replay_stdout))
 
             # Verify the result of this test
             if not xml.endswith(add_ext('.pov')):
+                print("pov test: False")
                 res = self._check_result_cqe(sig, ret)
             else:
+                print("pov test: True")
                 res = self._check_result_cfe(sig, xml_replay_stdout)
 
             # Keep track of how many tests passed verification
             if res == 0:
                 passed += 1
+
+        return passed
+
+    def check_single_result(self, replay_result, xml):
+        """ Check the results of cb-server and cb-replay
+
+        Arguments:
+            replay_result: the output of cb-replay
+            xml: path to test that was run
+
+        Returns:
+            Returns 0 if the test 'passed'
+            Returns -1 if the test 'failed'
+
+        Raises:
+            None
+        """
+        ret, replay_stdout = replay_result
+
+        passed = 0
+        # Pull out the section of the replay output
+        # corresponding to this test
+        xml_replay_stdout = replay_stdout.split(xml, 1)[1]
+        xml_replay_stdout = xml_replay_stdout.split('END REPLAY', 1)[0]
+
+        # Check if the CB crashed on this test, get its return code
+        sig = 0
+        sig_re = r'Process generated signal.+signal: (\d+)\)'
+        match = re.search(sig_re, xml_replay_stdout)
+        if match:
+            sig = int(match.group(1))
+
+        # Verify the result of this test
+        if not xml.endswith(add_ext('.pov')):
+            print("pov test: False")
+            res = self._check_result_cqe(sig, ret)
+        else:
+            print("pov test: True")
+            res = self._check_result_cfe(sig, xml_replay_stdout)
+
+        # Keep track of how many tests passed verification
+        if res == 0:
+            passed += 1
 
         return passed
 
@@ -635,9 +763,19 @@ class Runner(object):
         # Run all tests, keeping track of how many passed
         total_tests = sum(len(xmls) for xmls in xml_sets)
         passed_tests = 0
-        for xml_list in xml_sets:
-            replay_result = self.start_replay(xml_list)
-            passed_tests += self.check_result(replay_result, xml_list)
+        for i,xml_list in enumerate(xml_sets):
+            # enumerate starts at 0, so checking at start of the loop 
+            # to enable the failing fast method
+            # added by pdreiter @ 5/5/2020
+            if i != passed_tests:
+                 logging.warning('TOTAL TESTS: {}'.format(total_tests))
+                 logging.warning('TOTAL PASSED: {}'.format(passed_tests))
+                 return -1
+            if not self.genprog_enabled:
+                replay_result = self.start_replay(xml_list)
+                passed_tests += self.check_result(replay_result, xml_list)
+            else:
+                passed_tests += self.start_genprog_replay(xml_list)
 
         # Report the final results
         logging.warning('TOTAL TESTS: {}'.format(total_tests))
@@ -718,6 +856,8 @@ def main():
                         default=False, help='Negotate the CB seed from cb-replay')
     parser.add_argument('--cb_no_attach', required=False, action='store_true',
                         default=False, help='Do not attach to the CB')
+    parser.add_argument('--genprog', required=False, action='store_true',
+                        default=False, help='enable GenProg testing [fail fast]')
 
     exgroup = parser.add_argument_group(title='XML files')
     group = exgroup.add_mutually_exclusive_group(required=True)
@@ -775,7 +915,8 @@ def main():
                     args.directory, args.should_core, args.failure_ok,
                     args.debug, args.timeout, log_fh, args.cb_seed,
                     args.cb_seed_skip, args.max_send, args.concurrent,
-                    args.negotiate_seed, args.pov_seed, args.cb_no_attach)
+                    args.negotiate_seed, args.pov_seed, args.cb_no_attach,
+                    args.genprog)
 
     try:
         ret = runner.run()

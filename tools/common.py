@@ -1,6 +1,6 @@
 import os
 import sys
-import thread
+import _thread
 import threading
 
 # For OS specific tasks
@@ -54,7 +54,7 @@ class Timeout(object):
     raise_timeout = True  # Raises a TimeoutError if this is True
 
     def __init__(self, seconds):
-        self.timer = threading.Timer(seconds, thread.interrupt_main)
+        self.timer = threading.Timer(seconds, _thread.interrupt_main)
         self.timed_out = False
 
     def __enter__(self):

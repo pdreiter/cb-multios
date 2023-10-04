@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 
 import os
 import re
@@ -6,8 +6,16 @@ import signal
 import subprocess as sp
 from time import time, sleep
 import threading
+import codecs
 
 from common import IS_DARWIN, IS_LINUX, IS_WINDOWS, try_delete
+
+def setNB(fd):
+    import fcntl
+    flags=fcntl.fcntl(fd,fcntl.F_GETFL)
+    flags=flags|os.O_NONBLOCK
+    fcntl.fcntl(fd,fcntl.F_SETFL,flags)
+
 
 # Path to crash dumps in windows
 if IS_WINDOWS:
@@ -16,7 +24,7 @@ if IS_WINDOWS:
     CDB_PATH = 'C:/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe'
 
 
-def run(challenges, timeout, seed, logfunc):
+def run(challenges, timeout, seed, logfunc, enable_fixes=False):
     """ Challenge launcher for replay services
 
     This will setup fds for all challenges according to:
@@ -32,6 +40,12 @@ def run(challenges, timeout, seed, logfunc):
         (list): all processes that were started
     """
     cb_env = {'seed': seed}  # Environment variables for all challenges
+	
+    if os.environ.get('LD_BIND_NOW',None) is not None:
+	    cb_env['LD_BIND_NOW']='1'
+
+    if enable_fixes or (os.environ.get('ENABLE_FIXES',None) is not None):
+	    cb_env['ENABLE_FIXES']='1'
 
     # This is the first fd after all of the challenges
     last_fd = 2 * len(challenges) + 3
@@ -42,7 +56,7 @@ def run(challenges, timeout, seed, logfunc):
         os.closerange(3, last_fd)
 
         new_fd = 3  # stderr + 1
-        for i in xrange(len(challenges)):
+        for i in range(len(challenges)):
             # Create a pipe for every running binary
             rpipe, wpipe = os.pipe()
 
@@ -71,21 +85,23 @@ def run(challenges, timeout, seed, logfunc):
             cb_env['PIPE_COUNT'] = str(numpipes)
 
             # Store the HANDLE for each of the pipes
-            for i in xrange(len(challenges) * 2):
+            for i in range(len(challenges) * 2):
                 cb_env['PIPE_{}'.format(i)] = str(msvcrt.get_osfhandle(3 + i))  # First pipe is at 3
 
     # Start all challenges
     # Launch the main binary first
-    mainchal, otherchals = challenges[0], challenges[1:]
+    import shlex
+    mainchal, otherchals = shlex.split(challenges[0]), challenges[1:]
+    logfunc("mainchal: "+str(mainchal))
+    logfunc("# otherchals: "+str(len(otherchals)))
     procs = [sp.Popen(mainchal, env=cb_env, stdin=sp.PIPE,
-                      stdout=sp.PIPE, stderr=sp.PIPE)]
-
+                      stdout=sp.PIPE, stderr=sp.PIPE,bufsize=1)]
     # Any others should be launched with the same std i/o pipes
     # as the main binary
     if len(otherchals) > 0:
         main = procs[0]
-        procs += [sp.Popen(c, env=cb_env, stdin=main.stdin,
-                           stdout=main.stdout, stderr=main.stderr) for c in otherchals]
+        procs += [sp.Popen(shlex.split(c), env=cb_env, stdin=main.stdin,
+                           stdout=main.stdout, stderr=main.stderr,bufsize=1) for c in otherchals]
 
     # Start a watcher to report results when the challenges exit
     watcher = threading.Thread(target=chal_watcher, args=(challenges, procs, timeout, logfunc))
@@ -93,7 +109,6 @@ def run(challenges, timeout, seed, logfunc):
     watcher.start()
 
     return procs, watcher
-
 
 def chal_watcher(paths, procs, timeout, log):
     # Continue until any of the processes die
@@ -110,8 +125,11 @@ def chal_watcher(paths, procs, timeout, log):
         sleep(0.1)
 
     # Kill any remaining processes
-    for proc in procs:
+    for i,proc in enumerate(procs):
         if proc.poll() is None:
+            log("[DEBUG] Process {} did not terminate".format(i))
+            log("[DEBUG] Process type: "+str(type(proc)))
+            #proc.send_signal(signal.SIGKILL)
             proc.terminate()
             proc.wait()
 
@@ -123,21 +141,29 @@ def chal_watcher(paths, procs, timeout, log):
     # If any of the processes crashed, print out crash info
     for path, proc in zip(paths, procs):
         pid, sig = proc.pid, abs(proc.returncode)
-        if sig not in [None, 0, signal.SIGTERM]:
+        displayed=False
+        if sig not in [None]:
+            displayed=True
             log('[DEBUG] pid: {}, sig: {}'.format(pid, sig))
+        if sig not in [None, 0, signal.SIGTERM]:
+            if not displayed:
+               log('[DEBUG] pid: {}, sig: {}'.format(pid, sig))
 
             # Attempt to get register values
-            regs = get_core_dump_regs(path, pid, log)
-            if regs is not None:
+            regs,coredump = get_core_dump_regs(path, pid, log)
+            #log('[DEBUG]------\n[DEBUG] Coredump:\n{}\n[DEBUG]------'.format(coredump))
+            if regs is not None or sig>=64: # or sig == 9:
                 # If a core dump was generated, report this as a crash
                 # log('Process generated signal (pid: {}, signal: {}) - {}\n'.format(pid, sig, testpath))
                 log('Process generated signal (pid: {}, signal: {})'.format(pid, sig))
 
-                # Report the register states
-                reg_str = ' '.join(['{}:{}'.format(reg, val) for reg, val in regs.iteritems()])
-                log('register states - {}'.format(reg_str))
+                if regs is not None:
+                    # Report the register states
+                    reg_str = ' '.join(['{}:{}'.format(reg, val) for reg, val in regs.items()])
+                    log('register states - {}'.format(reg_str))
 
     # Final cleanup
+    #log('cleanup')
     clean_cores(paths, procs)
 
 
@@ -165,7 +191,12 @@ def get_core_dump_regs(path, pid, log):
         cmd = [
             'gdb',
             '--core', 'core',
-            '--batch', '-ex', 'info registers'
+            '--batch', 
+            '-ex', 'info registers', 
+            '-ex','backtrace'
+            #,
+            #'-ex','x/16wx $esp-8',
+            #'-ex','x/a  (void*)($esp+0x14)'
         ]
     elif IS_WINDOWS:
         # Dumps are named "[filename.exe].[pid].dmp"
@@ -178,19 +209,21 @@ def get_core_dump_regs(path, pid, log):
         ]
 
     # Read the registers
-    dbg_out = '\n'.join(sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE).communicate())
+    #log('cmd={}'.format(' '.join(cmd)))
+    dbg_out = b'\n'.join(sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE).communicate())
+    #log('dbg_out={}'.format(dbg_out))
 
     # Batch commands return successful even if there was an error loading a file
     # Check for these strings in the output instead
     errs = [
-        'No such file or directory',
-        "doesn't exist",
-        'cannot find the file specified'
+        b'No such file or directory',
+        b"doesn't exist",
+        b'cannot find the file specified'
     ]
 
     if any(err in dbg_out for err in errs):
         log('Core dump not found, are they enabled on your system?')
-        return
+        return None,None
 
     # Parse out registers/values
     regs = {}
@@ -198,13 +231,15 @@ def get_core_dump_regs(path, pid, log):
         for match in re.finditer(r'([a-z]+)=([a-fA-F0-9]+)', dbg_out):
             regs[match.group(1)] = match.group(2)
     else:
-        for line in dbg_out.split('\n'):
+        for line in dbg_out.split(b'\n'):
             # Try to match a register value
-            match = re.search(r'([a-z]+)[=\ ]+0x([a-fA-F0-9]+)', line)
+            #match = re.search(r'([a-z]+)[=\ ]+0x([a-fA-F0-9]+)', line)
+            #match = re.search(r'([a-z]+)[=\ ]+0x([a-fA-F0-9]+)', codecs.decode(line,'utf-8'))
+            match = re.search(r'([a-z]+)[=\ ]+0x([a-fA-F0-9]+)', codecs.decode(line,'ISO-8859-1'))
             if match is not None:
                 regs[match.group(1)] = match.group(2)
 
-    return regs
+    return regs,dbg_out
 
 
 def clean_cores(paths, procs):
@@ -215,7 +250,7 @@ def clean_cores(paths, procs):
         procs (list): List of all processes that may have generated core dumps
     """
     if IS_DARWIN:
-        map(try_delete, ['/cores/core.{}'.format(p.pid) for p in procs])
+        list(map(try_delete, ['/cores/core.{}'.format(p.pid) for p in procs]))
     elif IS_LINUX:
         try_delete('core')
     elif IS_WINDOWS:
